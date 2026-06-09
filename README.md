@@ -85,7 +85,7 @@ CPA-Manager-Plus 统计数据位于应用内部数据目录：
 需要 WSL 或 Linux 环境（需 `python3-pil` 或 `imagemagick` 以生成应用图标）：
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/E7G/cliproxyapi-fnos.git
 cd cliproxyapi-fnos
 chmod +x build.sh pack-fpk.sh scripts/*.sh
 ./build.sh
