@@ -1,0 +1,11 @@
+#!/bin/bash
+. $(dirname $0)/installer
+
+log_step "install_callback"
+call_func "save_wizard_variables" install_log
+sync_var_folder
+call_func "service_postinst" install_log
+fix_pkgvar_ownership
+if [ -n "${LOG_FILE}" ]; then
+    echo "Installation log: ${INST_LOG}" >> ${LOG_FILE}
+fi

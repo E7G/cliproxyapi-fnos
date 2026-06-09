@@ -1,0 +1,753 @@
+#!/bin/bash
+
+# 用户可编辑数据：/vol1/@appshare/CLIProxyAPI（TRIM_DATA_SHARE_PATHS）
+# 内部运行数据：TRIM_PKGVAR（service.log、应用 logs/ 等）
+DATA_DIR=""
+CONFIG_FILE=""
+PORT_SAVE=""
+PANEL_PORT_SAVE=""
+AUTH_DIR=""
+CREDENTIALS_FILE=""
+DATA_DIR_MARKER=""
+MANAGER_DATA_DIR=""
+DEFAULT_PANEL_PORT="18317"
+
+SVC_CWD="${TRIM_APPDEST}"
+SVC_BACKGROUND=y
+SVC_WRITE_PID=y
+LOG_FILE="${TRIM_PKGVAR}/service.log"
+SVC_WAIT_TIMEOUT=20
+
+SERVICE_COMMAND[0]="bin/CLIProxyAPIPlus -config ${TRIM_PKGVAR}/config.yaml"
+
+init_data_paths() {
+    local candidate
+
+    if [ -n "${DATA_DIR}" ]; then
+        return 0
+    fi
+
+    DATA_DIR_MARKER="${TRIM_PKGVAR}/.data_dir"
+
+    if [ -n "${TRIM_DATA_SHARE_PATHS:-}" ]; then
+        DATA_DIR="${TRIM_DATA_SHARE_PATHS%%:*}"
+    elif [ -f "${DATA_DIR_MARKER}" ]; then
+        DATA_DIR="$(tr -d '\r\n' < "${DATA_DIR_MARKER}")"
+    else
+        for candidate in \
+            "/vol1/@appshare/CLIProxyAPI" \
+            "/vol1/@appshare/CLIProxyAPI Plus" \
+            "/var/apps/${TRIM_APPNAME}/shares/CLIProxyAPI" \
+            "/var/apps/${TRIM_APPNAME}/shares/${TRIM_APPNAME}"
+        do
+            if [ -d "${candidate}" ]; then
+                DATA_DIR="${candidate}"
+                break
+            fi
+        done
+        [ -n "${DATA_DIR}" ] || DATA_DIR="/vol1/@appshare/CLIProxyAPI"
+    fi
+
+    [ -n "${DATA_DIR}" ] || DATA_DIR="${TRIM_PKGVAR}"
+
+    CONFIG_FILE="${DATA_DIR}/config.yaml"
+    PORT_SAVE="${DATA_DIR}/.port"
+    PANEL_PORT_SAVE="${DATA_DIR}/.panel_port"
+    AUTH_DIR="${DATA_DIR}/auths"
+    CREDENTIALS_FILE="${DATA_DIR}/CREDENTIALS.txt"
+    MANAGER_DATA_DIR="${TRIM_PKGVAR}/manager-data"
+    SERVICE_COMMAND[0]="bin/CLIProxyAPIPlus -config ${CONFIG_FILE}"
+}
+
+persist_data_dir() {
+    init_data_paths
+    [ -n "${DATA_DIR}" ] || return 0
+    printf '%s\n' "${DATA_DIR}" > "${DATA_DIR_MARKER}"
+}
+
+gen_secret() {
+    local len="${1:-16}"
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex "$len"
+    else
+        head -c "$((len * 2))" /dev/urandom | tr -dc 'a-f0-9' | head -c "$((len * 2))"
+    fi
+}
+
+ensure_dirs() {
+    init_data_paths
+    mkdir -p "${DATA_DIR}" "${AUTH_DIR}" "${TRIM_PKGVAR}/logs" "${MANAGER_DATA_DIR}" 2>/dev/null || true
+}
+
+read_config_port() {
+    local port=""
+    if [ -f "${CONFIG_FILE}" ]; then
+        port="$(grep -E '^[[:space:]]*port:' "${CONFIG_FILE}" 2>/dev/null | head -1 \
+            | sed -E 's/^[[:space:]]*port:[[:space:]]*//' \
+            | sed -E 's/^"([^"]*)".*/\1/; s/^'\''([^'\'']*)'\''.*/\1/')"
+    fi
+    [ -n "${port}" ] || port="8317"
+    printf '%s' "${port}"
+}
+
+read_panel_port() {
+    local port="${wizard_panel_port:-}"
+
+    if [ -z "${port}" ] && [ -f "${PANEL_PORT_SAVE}" ]; then
+        port="$(tr -d '\r\n' < "${PANEL_PORT_SAVE}")"
+    fi
+    if [ -z "${port}" ] && [ -f "${CREDENTIALS_FILE}" ]; then
+        port="$(grep '^PANEL_PORT=' "${CREDENTIALS_FILE}" | cut -d= -f2-)"
+    fi
+    [ -n "${port}" ] || port="${DEFAULT_PANEL_PORT}"
+    printf '%s' "${port}"
+}
+
+wait_for_tcp_port() {
+    local host="$1"
+    local port="$2"
+    local timeout="${3:-30}"
+    local elapsed=0
+
+    while [ "${elapsed}" -lt "${timeout}" ]; do
+        if command -v curl >/dev/null 2>&1; then
+            if curl -fsS --connect-timeout 2 "http://${host}:${port}/" >/dev/null 2>&1 \
+                || curl -fsS --connect-timeout 2 "http://${host}:${port}/v1/models" >/dev/null 2>&1; then
+                return 0
+            fi
+        elif (echo >/dev/tcp/"${host}"/"${port}") 2>/dev/null; then
+            return 0
+        elif command -v nc >/dev/null 2>&1 && nc -z "${host}" "${port}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    return 1
+}
+
+fix_data_ownership() {
+    local dir
+    for dir in "${DATA_DIR}" "${TRIM_PKGVAR}"; do
+        [ -n "${dir}" ] || continue
+        if [ -n "${TRIM_USERNAME:-}" ] && [ -n "${TRIM_GROUPNAME:-}" ]; then
+            chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${dir}" 2>/dev/null || true
+        elif [ -n "${TRIM_UID:-}" ] && [ -n "${TRIM_GID:-}" ]; then
+            chown -R "${TRIM_UID}:${TRIM_GID}" "${dir}" 2>/dev/null || true
+        fi
+    done
+}
+
+migrate_legacy_data() {
+    init_data_paths
+    [ "${DATA_DIR}" != "${TRIM_PKGVAR}" ] || return 0
+
+    local name src dst plus_share="/vol1/@appshare/CLIProxyAPI Plus"
+
+    if [ -d "${plus_share}" ] && [ "${plus_share}" != "${DATA_DIR}" ]; then
+        for name in config.yaml CREDENTIALS.txt 安装密钥.txt config.example.yaml .port; do
+            src="${plus_share}/${name}"
+            dst="${DATA_DIR}/${name}"
+            if [ -f "${src}" ] && [ ! -e "${dst}" ]; then
+                mv "${src}" "${dst}" 2>/dev/null || cp -p "${src}" "${dst}" 2>/dev/null || true
+                install_log "Migrated ${name} from CLIProxyAPI Plus share"
+            fi
+        done
+        src="${plus_share}/auths"
+        dst="${DATA_DIR}/auths"
+        if [ -d "${src}" ]; then
+            mkdir -p "${dst}" 2>/dev/null || true
+            if command -v rsync >/dev/null 2>&1; then
+                rsync -a "${src}/" "${dst}/" 2>/dev/null || true
+            else
+                cp -a "${src}/." "${dst}/" 2>/dev/null || true
+            fi
+            install_log "Migrated auths/ from CLIProxyAPI Plus share"
+        fi
+    fi
+
+    for name in config.yaml CREDENTIALS.txt 安装密钥.txt config.example.yaml .port; do
+        src="${TRIM_PKGVAR}/${name}"
+        dst="${DATA_DIR}/${name}"
+        if [ -f "${src}" ] && [ ! -e "${dst}" ]; then
+            mv "${src}" "${dst}" 2>/dev/null || cp -p "${src}" "${dst}" 2>/dev/null || true
+            install_log "Migrated ${name} → ${DATA_DIR}"
+        fi
+    done
+
+    src="${TRIM_PKGVAR}/auths"
+    dst="${DATA_DIR}/auths"
+    if [ -d "${src}" ]; then
+        mkdir -p "${dst}" 2>/dev/null || true
+        if command -v rsync >/dev/null 2>&1; then
+            rsync -a "${src}/" "${dst}/" 2>/dev/null || true
+        else
+            cp -a "${src}/." "${dst}/" 2>/dev/null || true
+        fi
+        install_log "Migrated auths/ → ${DATA_DIR}/auths"
+    fi
+}
+
+seed_data_dir() {
+    init_data_paths
+    local example_src="${TRIM_PKGVAR}/config.example.yaml"
+    [ -f "${example_src}" ] || example_src="${TRIM_APPDEST}/config.example.yaml"
+    if [ -f "${example_src}" ] && [ ! -f "${DATA_DIR}/config.example.yaml" ]; then
+        cp -p "${example_src}" "${DATA_DIR}/config.example.yaml" 2>/dev/null || true
+        install_log "Seeded config.example.yaml → ${DATA_DIR}"
+    fi
+}
+
+read_config_secret_key() {
+    [ -f "${CONFIG_FILE}" ] || return 0
+    grep -E '^\s*secret-key:' "${CONFIG_FILE}" 2>/dev/null | head -1 \
+        | sed -E 's/^[[:space:]]*secret-key:[[:space:]]*//' \
+        | sed -E 's/^"([^"]*)".*/\1/; s/^'\''([^'\'']*)'\''.*/\1/'
+}
+
+resolve_install_credentials() {
+    init_data_paths
+    local port="${wizard_port:-}"
+    local panel_port="${wizard_panel_port:-}"
+
+    if [ -z "${port}" ] && [ -f "${PORT_SAVE}" ]; then
+        port="$(tr -d '\r\n' < "${PORT_SAVE}")"
+    fi
+    if [ -z "${port}" ] && [ -f "${CREDENTIALS_FILE}" ]; then
+        port="$(grep '^PORT=' "${CREDENTIALS_FILE}" | cut -d= -f2-)"
+    fi
+    [ -n "${port}" ] || port="8317"
+
+    if [ -z "${panel_port}" ] && [ -f "${PANEL_PORT_SAVE}" ]; then
+        panel_port="$(tr -d '\r\n' < "${PANEL_PORT_SAVE}")"
+    fi
+    if [ -z "${panel_port}" ] && [ -f "${CREDENTIALS_FILE}" ]; then
+        panel_port="$(grep '^PANEL_PORT=' "${CREDENTIALS_FILE}" | cut -d= -f2-)"
+    fi
+    [ -n "${panel_port}" ] || panel_port="${DEFAULT_PANEL_PORT}"
+
+    RESOLVED_MGMT_SECRET="${wizard_mgmt_secret:-}"
+    RESOLVED_API_KEY="${wizard_api_key:-}"
+    RESOLVED_PANEL_ADMIN_KEY="${wizard_panel_admin_key:-}"
+
+    if [ -f "${CREDENTIALS_FILE}" ]; then
+        [ -z "${RESOLVED_MGMT_SECRET}" ] && \
+            RESOLVED_MGMT_SECRET="$(grep '^MGMT_SECRET=' "${CREDENTIALS_FILE}" | cut -d= -f2-)"
+        [ -z "${RESOLVED_API_KEY}" ] && \
+            RESOLVED_API_KEY="$(grep '^API_KEY=' "${CREDENTIALS_FILE}" | cut -d= -f2-)"
+        [ -z "${RESOLVED_PANEL_ADMIN_KEY}" ] && \
+            RESOLVED_PANEL_ADMIN_KEY="$(grep '^PANEL_ADMIN_KEY=' "${CREDENTIALS_FILE}" | cut -d= -f2-)"
+    fi
+
+    [ -n "${RESOLVED_MGMT_SECRET}" ] || RESOLVED_MGMT_SECRET="$(gen_secret 16)"
+    [ -n "${RESOLVED_API_KEY}" ] || RESOLVED_API_KEY="$(gen_secret 16)"
+    [ -n "${RESOLVED_PANEL_ADMIN_KEY}" ] || RESOLVED_PANEL_ADMIN_KEY="$(gen_secret 16)"
+    RESOLVED_PORT="${port}"
+    RESOLVED_PANEL_PORT="${panel_port}"
+}
+
+repair_management_settings() {
+    local mgmt_secret api_key port current_secret repaired=0
+
+    init_data_paths
+    [ -f "${CONFIG_FILE}" ] || return 0
+
+    current_secret="$(read_config_secret_key)"
+    if [ -z "${current_secret}" ]; then
+        resolve_install_credentials
+        mgmt_secret="${RESOLVED_MGMT_SECRET}"
+        api_key="${RESOLVED_API_KEY}"
+        port="${RESOLVED_PORT}"
+        if grep -qE '^\s*secret-key:' "${CONFIG_FILE}"; then
+            sed -i "s|^\([[:space:]]*secret-key:\).*|\1 \"${mgmt_secret}\"|" "${CONFIG_FILE}"
+        else
+            sed -i "/^remote-management:/a\\  secret-key: \"${mgmt_secret}\"" "${CONFIG_FILE}"
+        fi
+        write_credentials_files "${mgmt_secret}" "${api_key}" "${port}"
+        repaired=1
+        install_log "Repaired empty management secret-key in ${CONFIG_FILE}"
+    fi
+
+    if grep -qE '^\s*allow-remote:\s*false' "${CONFIG_FILE}"; then
+        sed -i 's/^\([[:space:]]*allow-remote:\s*\)false/\1true/' "${CONFIG_FILE}"
+        repaired=1
+        install_log "Enabled allow-remote for NAS management access"
+    fi
+
+    if grep -qE '^\s*disable-control-panel:' "${CONFIG_FILE}"; then
+        if grep -qE '^\s*disable-control-panel:\s*false' "${CONFIG_FILE}"; then
+            sed -i 's/^\([[:space:]]*disable-control-panel:\s*\)false/\1true/' "${CONFIG_FILE}"
+            repaired=1
+            install_log "Disabled CPA built-in panel (use CPA-Manager-Plus on panel port instead)"
+        fi
+    else
+        sed -i '/^remote-management:/a\  disable-control-panel: true' "${CONFIG_FILE}"
+        repaired=1
+        install_log "Added disable-control-panel: true for CPA-Manager-Plus"
+    fi
+
+    if grep -qE 'router-for-me/Cli-Proxy-API-Management-Center' "${CONFIG_FILE}" \
+        || grep -qE 'kaitranntt/Cli-Proxy-API-Management-Center' "${CONFIG_FILE}"; then
+        sed -i 's|https://github.com/router-for-me/Cli-Proxy-API-Management-Center|https://github.com/seakee/CPA-Manager-Plus|g' "${CONFIG_FILE}"
+        sed -i 's|https://github.com/kaitranntt/Cli-Proxy-API-Management-Center|https://github.com/seakee/CPA-Manager-Plus|g' "${CONFIG_FILE}"
+        repaired=1
+        install_log "Updated panel repository reference to CPA-Manager-Plus"
+    fi
+
+    if grep -qE '^\s*usage-statistics-enabled:\s*false' "${CONFIG_FILE}"; then
+        sed -i 's/^\([[:space:]]*usage-statistics-enabled:\s*\)false/\1true/' "${CONFIG_FILE}"
+        repaired=1
+        install_log "Enabled usage-statistics-enabled for request monitoring"
+    fi
+
+    if grep -qE '^\s*redis-usage-queue-retention-seconds:\s*[0-9]+' "${CONFIG_FILE}"; then
+        local retention
+        retention="$(grep -E '^\s*redis-usage-queue-retention-seconds:' "${CONFIG_FILE}" | head -1 \
+            | sed -E 's/^[[:space:]]*redis-usage-queue-retention-seconds:[[:space:]]*//')"
+        if [ -n "${retention}" ] && [ "${retention}" -lt 300 ] 2>/dev/null; then
+            sed -i 's/^\([[:space:]]*redis-usage-queue-retention-seconds:\s*\)[0-9]\+/\1300/' "${CONFIG_FILE}"
+            repaired=1
+            install_log "Increased redis-usage-queue-retention-seconds to 300 for CPA-Manager-Plus"
+        fi
+    else
+        sed -i "/^usage-statistics-enabled: true/a\\redis-usage-queue-retention-seconds: 300" "${CONFIG_FILE}"
+        repaired=1
+        install_log "Added redis-usage-queue-retention-seconds: 300"
+    fi
+
+    if [ ! -f "${CREDENTIALS_FILE}" ] || ! grep -q '^PANEL_ADMIN_KEY=' "${CREDENTIALS_FILE}" 2>/dev/null; then
+        resolve_install_credentials
+        write_credentials_files "${RESOLVED_MGMT_SECRET}" "${RESOLVED_API_KEY}" "${RESOLVED_PORT}" "${RESOLVED_PANEL_ADMIN_KEY}" "${RESOLVED_PANEL_PORT}"
+        repaired=1
+        install_log "Generated CPA-Manager-Plus panel admin key"
+    fi
+
+    [ "${repaired}" -eq 1 ] && fix_data_ownership
+}
+
+write_default_config() {
+    local port="${1:-8317}"
+    local mgmt_secret="$2"
+    local api_key="$3"
+    cat > "${CONFIG_FILE}" <<EOF
+# CLIProxyAPI Plus 配置文件（安装时自动生成）
+# 目录：${DATA_DIR}
+port: ${port}
+
+remote-management:
+  allow-remote: true
+  secret-key: "${mgmt_secret}"
+  disable-control-panel: true
+  panel-github-repository: "https://github.com/seakee/CPA-Manager-Plus"
+
+auth-dir: "${AUTH_DIR}"
+
+api-keys:
+  - "${api_key}"
+
+debug: false
+usage-statistics-enabled: true
+redis-usage-queue-retention-seconds: 300
+logging-to-file: true
+logs-dir: "${TRIM_PKGVAR}/logs"
+logs-max-total-size-mb: 100
+EOF
+    chmod 644 "${CONFIG_FILE}" 2>/dev/null || true
+}
+
+write_credentials_files() {
+    local mgmt_secret="$1"
+    local api_key="$2"
+    local port="$3"
+    local panel_admin_key="$4"
+    local panel_port="$5"
+    local target_file="${DATA_DIR}/安装密钥.txt"
+
+    init_data_paths
+    umask 077
+    cat > "${CREDENTIALS_FILE}" <<EOF
+# CLIProxyAPI 安装密钥（请勿删除，升级时会复用）
+MGMT_SECRET=${mgmt_secret}
+API_KEY=${api_key}
+PORT=${port}
+PANEL_PORT=${panel_port}
+PANEL_ADMIN_KEY=${panel_admin_key}
+EOF
+    chmod 600 "${CREDENTIALS_FILE}" 2>/dev/null || true
+    echo "${panel_port}" > "${PANEL_PORT_SAVE}"
+
+    credentials_notice_body "${mgmt_secret}" "${api_key}" "${port}" "${panel_admin_key}" "${panel_port}" > "${target_file}"
+    chmod 644 "${target_file}" 2>/dev/null || true
+    install_log "Credentials notice → ${target_file}"
+}
+
+credentials_notice_body() {
+    local mgmt_secret="$1"
+    local api_key="$2"
+    local port="$3"
+    local panel_admin_key="$4"
+    local panel_port="$5"
+    cat <<EOF
+CLIProxyAPI Plus 安装密钥
+====================
+
+CPA 管理密钥: ${mgmt_secret}
+面板登录密钥: ${panel_admin_key}
+API Key:      ${api_key}
+
+API 地址:     http://<NAS_IP>:${port}
+管理面板:     http://<NAS_IP>:${panel_port}/management.html
+
+说明:
+- 管理面板由 CPA-Manager-Plus 提供，支持缓存命中、费用估算与请求监控
+- 首次打开面板请使用「面板登录密钥」登录
+- CPA 管理密钥仅用于 CPA 后端 API，面板登录请使用面板登录密钥
+
+配置文件目录:
+  文件管理 → 应用文件 → CLIProxyAPI
+
+请妥善保存。
+EOF
+}
+
+patch_config_paths() {
+    init_data_paths
+    [ -f "${CONFIG_FILE}" ] || return
+    sed -i "s|^auth-dir:.*|auth-dir: \"${AUTH_DIR}\"|" "${CONFIG_FILE}"
+    sed -i "s|__AUTH_DIR__|${AUTH_DIR}|g" "${CONFIG_FILE}" 2>/dev/null || true
+    sed -i "s|^logging-to-file:.*|logging-to-file: true|" "${CONFIG_FILE}" 2>/dev/null || true
+    if grep -qE '^\s*logs-dir:' "${CONFIG_FILE}"; then
+        sed -i "s|^logs-dir:.*|logs-dir: \"${TRIM_PKGVAR}/logs\"|" "${CONFIG_FILE}"
+    else
+        sed -i "/^logging-to-file: true/a\\logs-dir: \"${TRIM_PKGVAR}/logs\"" "${CONFIG_FILE}"
+    fi
+}
+
+icon_file_md5() {
+    md5sum "$1" 2>/dev/null | awk '{print $1}'
+}
+
+is_qb_placeholder_icon() {
+    [ "$(icon_file_md5 "$1")" = "53e1db100c30b07227aa9a4a3a775ef4" ]
+}
+
+find_icon_source_dir() {
+    local dir app_root="/var/apps/${TRIM_APPNAME}"
+
+    for dir in \
+        "${TRIM_APPDEST}/ui/images" \
+        "${TRIM_APPDEST}/target/ui/images" \
+        "${app_root}/ui/images" \
+        "${app_root}/target/ui/images"
+    do
+        if [ -f "${dir}/256.png" ] || [ -f "${dir}/64.png" ]; then
+            printf '%s' "${dir}"
+            return 0
+        fi
+    done
+
+    # fpk 根目录的 ICON.PNG（构建时已写入 256px）
+    for dir in "${TRIM_APPDEST}" "${app_root}" "${app_root}/target"; do
+        if [ -f "${dir}/ICON_256.PNG" ] || [ -f "${dir}/ICON.PNG" ]; then
+            mkdir -p "${TRIM_APPDEST}/ui/images" 2>/dev/null || true
+            [ -f "${dir}/ICON_256.PNG" ] && cp -fp "${dir}/ICON_256.PNG" "${TRIM_APPDEST}/ui/images/256.png"
+            [ -f "${dir}/ICON.PNG" ] && cp -fp "${dir}/ICON.PNG" "${TRIM_APPDEST}/ui/images/256.png"
+            [ -f "${dir}/ICON.PNG" ] && cp -fp "${dir}/ICON.PNG" "${TRIM_APPDEST}/ui/images/64.png"
+            [ -f "${TRIM_APPDEST}/ui/images/256.png" ] || return 1
+            printf '%s' "${TRIM_APPDEST}/ui/images"
+            return 0
+        fi
+    done
+    return 1
+}
+
+resolve_icon_file() {
+    local src_img="$1"
+    local want="$2"
+    if [ "${want}" = "256" ] && [ -f "${src_img}/256.png" ]; then
+        printf '%s' "${src_img}/256.png"
+    elif [ -f "${src_img}/64.png" ]; then
+        printf '%s' "${src_img}/64.png"
+    elif [ -f "${src_img}/256.png" ]; then
+        printf '%s' "${src_img}/256.png"
+    else
+        return 1
+    fi
+}
+
+deploy_icons() {
+    local app_root="/var/apps/${TRIM_APPNAME}"
+    local src_img dest_img src_file icon_256 icon_64 dest target
+
+    src_img="$(find_icon_source_dir)" || src_img=""
+    if [ -z "${src_img}" ]; then
+        install_log "WARN: icon source not found, skipping icon deploy"
+        return 0
+    fi
+
+    icon_256="$(resolve_icon_file "${src_img}" 256)" || icon_256=""
+    icon_64="$(resolve_icon_file "${src_img}" 64)" || icon_64="${icon_256}"
+    [ -n "${icon_256}" ] || icon_256="${icon_64}"
+    [ -n "${icon_64}" ] || icon_64="${icon_256}"
+
+    for dest_img in \
+        "${TRIM_APPDEST}/ui/images" \
+        "${TRIM_APPDEST}/target/ui/images" \
+        "${app_root}/ui/images" \
+        "${app_root}/target/ui/images"
+    do
+        mkdir -p "${dest_img}" 2>/dev/null || true
+        for src_file in "${src_img}"/*.png; do
+            [ -f "${src_file}" ] || continue
+            cp -fp "${src_file}" "${dest_img}/" 2>/dev/null || true
+        done
+        [ -n "${icon_256}" ] && cp -fp "${icon_256}" "${dest_img}/256.png" 2>/dev/null || true
+        [ -n "${icon_64}" ] && cp -fp "${icon_64}" "${dest_img}/64.png" 2>/dev/null || true
+    done
+
+    # 应用中心读取 /var/apps/<appname>/ICON.PNG（建议 256x256）；升级时不会自动替换，需显式刷新
+    for target in \
+        "${app_root}/ICON.PNG" \
+        "${app_root}/ICON_256.PNG" \
+        "${TRIM_APPDEST}/ICON.PNG" \
+        "${TRIM_APPDEST}/ICON_256.PNG" \
+        "${app_root}/target/ICON.PNG" \
+        "${app_root}/target/ICON_256.PNG"
+    do
+        dest="$(dirname "${target}")"
+        mkdir -p "${dest}" 2>/dev/null || true
+        case "${target}" in
+            *ICON_256.PNG)
+                [ -n "${icon_256}" ] && cp -f "${icon_256}" "${target}" 2>/dev/null || true
+                ;;
+            *ICON.PNG)
+                [ -n "${icon_256}" ] && cp -f "${icon_256}" "${target}" 2>/dev/null || true
+                ;;
+        esac
+        if [ -f "${target}" ] && is_qb_placeholder_icon "${target}"; then
+            cp -f "${icon_256}" "${target}" 2>/dev/null || true
+            install_log "Replaced qBittorrent placeholder → ${target}"
+        fi
+    done
+
+    install_log "Deployed app-center icons from ${src_img} → ${app_root}"
+}
+
+ensure_config() {
+    init_data_paths
+    migrate_legacy_data
+    seed_data_dir
+    ensure_dirs
+
+    if [ ! -f "${CONFIG_FILE}" ]; then
+        resolve_install_credentials
+        write_default_config "${RESOLVED_PORT}" "${RESOLVED_MGMT_SECRET}" "${RESOLVED_API_KEY}"
+        write_credentials_files "${RESOLVED_MGMT_SECRET}" "${RESOLVED_API_KEY}" "${RESOLVED_PORT}" "${RESOLVED_PANEL_ADMIN_KEY}" "${RESOLVED_PANEL_PORT}"
+        echo "${RESOLVED_PORT}" > "${PORT_SAVE}"
+        install_log "Generated config + credentials → ${CONFIG_FILE}"
+    else
+        patch_config_paths
+        repair_management_settings
+    fi
+    persist_data_dir
+    fix_data_ownership
+}
+
+apply_port() {
+    local port="$1"
+    [ -z "$port" ] && return
+    ensure_config
+    sed -i "s/^port:.*/port: ${port}/" "${CONFIG_FILE}"
+    echo "${port}" > "${PORT_SAVE}"
+    if [ -f "${CREDENTIALS_FILE}" ]; then
+        sed -i "s/^PORT=.*/PORT=${port}/" "${CREDENTIALS_FILE}" 2>/dev/null || true
+    fi
+    install_log "Updated config.yaml port=${port}"
+}
+
+apply_panel_port() {
+    local panel_port="$1"
+    [ -z "$panel_port" ] && return
+    ensure_config
+    echo "${panel_port}" > "${PANEL_PORT_SAVE}"
+    if [ -f "${CREDENTIALS_FILE}" ]; then
+        if grep -q '^PANEL_PORT=' "${CREDENTIALS_FILE}"; then
+            sed -i "s/^PANEL_PORT=.*/PANEL_PORT=${panel_port}/" "${CREDENTIALS_FILE}" 2>/dev/null || true
+        else
+            echo "PANEL_PORT=${panel_port}" >> "${CREDENTIALS_FILE}"
+        fi
+    fi
+    install_log "Updated panel port=${panel_port}"
+}
+
+service_postinst() {
+    ensure_config
+    if [ -n "${wizard_port:-}" ]; then
+        apply_port "${wizard_port}"
+    fi
+    if [ -n "${wizard_panel_port:-}" ]; then
+        apply_panel_port "${wizard_panel_port}"
+    fi
+    deploy_icons
+    fix_data_ownership
+}
+
+service_postupgrade() {
+    ensure_config
+    if [ -f "$PORT_SAVE" ]; then
+        apply_port "$(cat "$PORT_SAVE")"
+    fi
+    deploy_icons
+    fix_data_ownership
+}
+
+service_postconfig() {
+    if [ -n "${wizard_port:-}" ]; then
+        apply_port "${wizard_port}"
+    fi
+    if [ -n "${wizard_panel_port:-}" ]; then
+        apply_panel_port "${wizard_panel_port}"
+    fi
+}
+
+service_prestart() {
+    ensure_config
+    repair_management_settings
+    deploy_icons
+}
+
+launch_daemon() {
+    local cpa_cmd manager_cmd cpa_port panel_port mgmt_secret panel_admin_key cpa_pid manager_pid err_tail
+
+    init_data_paths
+    [ -x "${SVC_CWD}/bin/CLIProxyAPIPlus" ] || error_exit "缺少可执行文件 bin/CLIProxyAPIPlus，请重新安装应用。"
+    [ -x "${SVC_CWD}/bin/cpa-manager-plus" ] || error_exit "缺少可执行文件 bin/cpa-manager-plus，请重新安装应用。"
+    [ -f "${CONFIG_FILE}" ] || error_exit "配置文件不存在: ${CONFIG_FILE}。请在「应用文件 → CLIProxyAPI」检查 config.yaml。"
+
+    resolve_install_credentials
+    cpa_cmd="${SERVICE_COMMAND[0]}"
+    cpa_port="$(read_config_port)"
+    panel_port="$(read_panel_port)"
+    mgmt_secret="${RESOLVED_MGMT_SECRET:-$(grep '^MGMT_SECRET=' "${CREDENTIALS_FILE}" 2>/dev/null | cut -d= -f2-)}"
+    panel_admin_key="${RESOLVED_PANEL_ADMIN_KEY:-$(grep '^PANEL_ADMIN_KEY=' "${CREDENTIALS_FILE}" 2>/dev/null | cut -d= -f2-)}"
+    [ -n "${mgmt_secret}" ] || mgmt_secret="$(read_config_secret_key)"
+    [ -n "${panel_admin_key}" ] || panel_admin_key="$(gen_secret 16)"
+
+    mkdir -p "${MANAGER_DATA_DIR}" 2>/dev/null || true
+
+    cd "${SVC_CWD}" || error_exit "无法进入应用目录: ${SVC_CWD}"
+
+    echo "[$(date '+%Y/%m/%d %H:%M:%S')] Starting CLIProxyAPI Plus on port ${cpa_port} ..." >> "${LOG_FILE}"
+    ${cpa_cmd} >> "${LOG_FILE}" 2>&1 &
+    cpa_pid="$!"
+    printf '%s' "${cpa_pid}" > "${PID_FILE}"
+
+    if ! wait_for_tcp_port "127.0.0.1" "${cpa_port}" "${SVC_WAIT_TIMEOUT}"; then
+        err_tail="$(tail -n 30 "${LOG_FILE}" 2>/dev/null | tail -n 12)"
+        if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+            {
+                echo "CLIProxyAPI 启动失败：端口 ${cpa_port} 未就绪。"
+                echo "配置: ${CONFIG_FILE}"
+                echo "命令: ${cpa_cmd}"
+                [ -n "${err_tail}" ] && echo "最近日志:" && echo "${err_tail}"
+            } > "${TRIM_TEMP_LOGFILE}"
+        fi
+        install_log "CLIProxyAPI startup failed on port ${cpa_port}"
+        kill "${cpa_pid}" 2>/dev/null || true
+        rm -f "${PID_FILE}" 2>/dev/null || true
+        return 1
+    fi
+
+    manager_cmd="bin/cpa-manager-plus"
+    echo "[$(date '+%Y/%m/%d %H:%M:%S')] Starting CPA-Manager-Plus on port ${panel_port} ..." >> "${LOG_FILE}"
+
+    HTTP_ADDR="0.0.0.0:${panel_port}" \
+    USAGE_DATA_DIR="${MANAGER_DATA_DIR}" \
+    CPA_UPSTREAM_URL="http://127.0.0.1:${cpa_port}" \
+    CPA_MANAGEMENT_KEY="${mgmt_secret}" \
+    CPA_MANAGER_ADMIN_KEY="${panel_admin_key}" \
+    USAGE_COLLECTOR_MODE="auto" \
+    USAGE_POLL_INTERVAL_MS="500" \
+    ${manager_cmd} >> "${LOG_FILE}" 2>&1 &
+    manager_pid="$!"
+    printf '\n%s' "${manager_pid}" >> "${PID_FILE}"
+
+    if ! wait_for_tcp_port "127.0.0.1" "${panel_port}" "${SVC_WAIT_TIMEOUT}"; then
+        err_tail="$(tail -n 30 "${LOG_FILE}" 2>/dev/null | tail -n 12)"
+        if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+            {
+                echo "CPA-Manager-Plus 启动失败：端口 ${panel_port} 未就绪。"
+                echo "CPA 地址: http://127.0.0.1:${cpa_port}"
+                echo "数据目录: ${MANAGER_DATA_DIR}"
+                [ -n "${err_tail}" ] && echo "最近日志:" && echo "${err_tail}"
+            } > "${TRIM_TEMP_LOGFILE}"
+        fi
+        install_log "CPA-Manager-Plus startup failed on port ${panel_port}"
+        kill "${manager_pid}" 2>/dev/null || true
+        kill "${cpa_pid}" 2>/dev/null || true
+        rm -f "${PID_FILE}" 2>/dev/null || true
+        return 1
+    fi
+
+    if ! wait_for_status 0 "${SVC_WAIT_TIMEOUT}"; then
+        err_tail="$(tail -n 30 "${LOG_FILE}" 2>/dev/null | tail -n 12)"
+        if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+            {
+                echo "服务启动后进程异常退出。"
+                echo "配置: ${CONFIG_FILE}"
+                [ -n "${err_tail}" ] && echo "最近日志:" && echo "${err_tail}"
+            } > "${TRIM_TEMP_LOGFILE}"
+        fi
+        install_log "Service exited unexpectedly after startup"
+        return 1
+    fi
+
+    install_log "Started CLIProxyAPI Plus (${cpa_port}) and CPA-Manager-Plus (${panel_port})"
+    return 0
+}
+
+daemon_status_ex() {
+    if daemon_status; then
+        return 0
+    fi
+    if pgrep -f "bin/CLIProxyAPIPlus" >/dev/null 2>&1 \
+        && pgrep -f "bin/cpa-manager-plus" >/dev/null 2>&1; then
+        {
+            pgrep -f "bin/CLIProxyAPIPlus" | head -n 1
+            pgrep -f "bin/cpa-manager-plus" | head -n 1
+        } > "${PID_FILE}"
+        return 0
+    fi
+    return 1
+}
+
+ensure_stopped() {
+    pkill -f "bin/cpa-manager-plus" 2>/dev/null || true
+    pkill -f "bin/CLIProxyAPIPlus" 2>/dev/null || true
+    pkill -f "bin/CLIProxyAPI" 2>/dev/null || true
+    sleep 1
+    if pgrep -f "bin/CLIProxyAPI" > /dev/null 2>&1 \
+        || pgrep -f "bin/cpa-manager-plus" > /dev/null 2>&1; then
+        pkill -9 -f "bin/cpa-manager-plus" 2>/dev/null || true
+        pkill -9 -f "bin/CLIProxyAPIPlus" 2>/dev/null || true
+        pkill -9 -f "bin/CLIProxyAPI" 2>/dev/null || true
+        sleep 1
+    fi
+}
+
+service_preupgrade() {
+    ensure_stopped
+}
+
+service_preuninst() {
+    ensure_stopped
+}
+
+service_poststop() {
+    ensure_stopped
+}
+
+# 兼容 install_callback 中的旧调用名
+fix_pkgvar_ownership() {
+    fix_data_ownership
+}

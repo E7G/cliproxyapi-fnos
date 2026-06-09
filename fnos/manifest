@@ -1,0 +1,15 @@
+appname         = cliproxyapi
+version         = 7.1.45-0.4
+display_name    = CLIProxyAPI Plus
+platform        = x86
+maintainer      = kaitranntt
+maintainer_url  = https://github.com/kaitranntt/CLIProxyAPIPlus
+distributor     = community
+distributor_url = https://github.com/kaitranntt/CLIProxyAPIPlus
+desktop_uidir   = ui
+desktop_applaunchname = cliproxyapi.Application
+service_port    = 8317
+checkport       = false
+desc            = CLIProxyAPI Plus + CPA-Manager-Plus：API 代理（8317）与增强管理面板（18317），支持缓存命中、费用估算、请求监控与 SQLite 持久化统计（原生二进制，无需 Docker）。
+source          = thirdparty
+checksum        = 

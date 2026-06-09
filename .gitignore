@@ -1,0 +1,24 @@
+# 构建产物
+dist/
+*.fpk
+*.fpk.*
+
+# 构建时生成的安装向导（含预生成密钥，勿提交）
+fnos/wizard/install
+
+# 运行时/本地敏感数据
+var/config.yaml
+var/CREDENTIALS.txt
+var/安装密钥.txt
+var/README.txt
+var/.show-credentials-once
+var/auths/*
+!var/auths/.gitkeep
+var/logs/*
+!var/logs/.gitkeep
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+*.swp
+*~

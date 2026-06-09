@@ -1,0 +1,27 @@
+[
+    {
+        "stepTitle": "CLIProxyAPI Plus",
+        "items": [
+            {
+                "type": "text",
+                "field": "wizard_port",
+                "label": "API 端口",
+                "initValue": "8317",
+                "rules": [
+                    { "required": true, "message": "请输入端口号" },
+                    { "pattern": "^[0-9]+$", "message": "端口必须为数字" }
+                ]
+            },
+            {
+                "type": "text",
+                "field": "wizard_panel_port",
+                "label": "管理面板端口",
+                "initValue": "18317",
+                "rules": [
+                    { "required": true, "message": "请输入端口号" },
+                    { "pattern": "^[0-9]+$", "message": "端口必须为数字" }
+                ]
+            }
+        ]
+    }
+]
