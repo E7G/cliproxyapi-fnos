@@ -428,11 +428,13 @@ icon_file_md5() {
 }
 
 is_qb_placeholder_icon() {
-    [ "$(icon_file_md5 "$1")" = "53e1db100c30b07227aa9a4a3a775ef4" ]
+    local hash
+    hash="$(icon_file_md5 "$1")"
+    [ "${hash}" = "53e1db100c30b07227aa9a4a3a775ef4" ] || \
+        [ "${hash}" = "1459c3c26c642ab8d204c0b453da442d" ]
 }
-
 find_icon_source_dir() {
-    local dir app_root="/var/apps/${TRIM_APPNAME}"
+    local dir app_root="/var/apps/${TRIM_APPNAME}" candidate
 
     for dir in \
         "${TRIM_APPDEST}/ui/images" \
@@ -440,19 +442,40 @@ find_icon_source_dir() {
         "${app_root}/ui/images" \
         "${app_root}/target/ui/images"
     do
-        if [ -f "${dir}/256.png" ] || [ -f "${dir}/64.png" ]; then
+        candidate=""
+        if [ -f "${dir}/256.png" ] && ! is_qb_placeholder_icon "${dir}/256.png"; then
+            candidate="${dir}/256.png"
+        elif [ -f "${dir}/64.png" ] && ! is_qb_placeholder_icon "${dir}/64.png"; then
+            candidate="${dir}/64.png"
+        fi
+
+        if [ -n "${candidate}" ]; then
             printf '%s' "${dir}"
             return 0
+        fi
+
+        if [ -f "${dir}/256.png" ] || [ -f "${dir}/64.png" ]; then
+            install_log "Skip stale qBittorrent placeholder icons in ${dir}"
         fi
     done
 
     # fpk 根目录的 ICON.PNG（构建时已写入 256px）
     for dir in "${TRIM_APPDEST}" "${app_root}" "${app_root}/target"; do
         if [ -f "${dir}/ICON_256.PNG" ] || [ -f "${dir}/ICON.PNG" ]; then
+            if [ -f "${dir}/ICON_256.PNG" ] && is_qb_placeholder_icon "${dir}/ICON_256.PNG" \
+                && { [ ! -f "${dir}/ICON.PNG" ] || is_qb_placeholder_icon "${dir}/ICON.PNG"; }; then
+                install_log "Skip stale qBittorrent placeholder root icons in ${dir}"
+                continue
+            fi
+
             mkdir -p "${TRIM_APPDEST}/ui/images" 2>/dev/null || true
             [ -f "${dir}/ICON_256.PNG" ] && cp -fp "${dir}/ICON_256.PNG" "${TRIM_APPDEST}/ui/images/256.png"
-            [ -f "${dir}/ICON.PNG" ] && cp -fp "${dir}/ICON.PNG" "${TRIM_APPDEST}/ui/images/256.png"
-            [ -f "${dir}/ICON.PNG" ] && cp -fp "${dir}/ICON.PNG" "${TRIM_APPDEST}/ui/images/64.png"
+            if [ -f "${dir}/ICON.PNG" ] && ! is_qb_placeholder_icon "${dir}/ICON.PNG"; then
+                [ -f "${TRIM_APPDEST}/ui/images/256.png" ] || cp -fp "${dir}/ICON.PNG" "${TRIM_APPDEST}/ui/images/256.png"
+                cp -fp "${dir}/ICON.PNG" "${TRIM_APPDEST}/ui/images/64.png"
+            elif [ -f "${TRIM_APPDEST}/ui/images/256.png" ]; then
+                cp -fp "${TRIM_APPDEST}/ui/images/256.png" "${TRIM_APPDEST}/ui/images/64.png"
+            fi
             [ -f "${TRIM_APPDEST}/ui/images/256.png" ] || return 1
             printf '%s' "${TRIM_APPDEST}/ui/images"
             return 0
@@ -464,17 +487,16 @@ find_icon_source_dir() {
 resolve_icon_file() {
     local src_img="$1"
     local want="$2"
-    if [ "${want}" = "256" ] && [ -f "${src_img}/256.png" ]; then
+    if [ "${want}" = "256" ] && [ -f "${src_img}/256.png" ] && ! is_qb_placeholder_icon "${src_img}/256.png"; then
         printf '%s' "${src_img}/256.png"
-    elif [ -f "${src_img}/64.png" ]; then
+    elif [ -f "${src_img}/64.png" ] && ! is_qb_placeholder_icon "${src_img}/64.png"; then
         printf '%s' "${src_img}/64.png"
-    elif [ -f "${src_img}/256.png" ]; then
+    elif [ -f "${src_img}/256.png" ] && ! is_qb_placeholder_icon "${src_img}/256.png"; then
         printf '%s' "${src_img}/256.png"
     else
         return 1
     fi
 }
-
 deploy_icons() {
     local app_root="/var/apps/${TRIM_APPNAME}"
     local src_img dest_img src_file icon_256 icon_64 dest target
